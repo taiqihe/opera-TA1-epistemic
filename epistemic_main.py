@@ -63,6 +63,18 @@ def batched_forward(args, tokenizer, model, pairs):
     all_labels = [model.config.id2label[idx] for idx in all_ids]
     return all_labels
 
+
+def categorical_f1(y, pred):
+    cats = set(pred)
+    scores = dict()
+    for cat in cats:
+        correct = np.sum(np.logical_and(np.char.equal(y, [cat]), np.char.equal(y, pred)))
+        scores[cat] = [correct/np.sum(np.char.equal(pred, [cat])), correct/np.sum(np.char.equal(y, [cat]))]
+
+    scores = {c:2*s[0]*s[1]/(s[0]+s[1]+1e-7) for c,s in scores.items()}
+    return scores
+
+
 def decode_gold(args, tokenizer, model):
     # load dataset
     input_path = Path(args.input_path)
@@ -92,8 +104,7 @@ def decode_gold(args, tokenizer, model):
             labels = decode_frames(args, tokenizer, model, frames_dict, subtopics, False)
             labels_tf, labels_certainty = zip(*[l.split('-') for l in labels.values()])
             f_tf, f_certainty = zip(*[f[2].split('-') for f in frames])
-            comp = lambda x,y: np.mean(np.char.equal(x,y))
-            logging.info(f'Processed annotation file {file}: found {len(frames)} frames, tf acc {comp(f_tf, labels_tf)}, certainty acc {comp(f_certainty, labels_certainty)}')
+            logging.info(f'Processed annotation file {file}: found {len(frames)} frames, tf categorical f1 {categorical_f1(f_tf, labels_tf)}, certainty categorical f1 {categorical_f1(f_certainty, labels_certainty)}')
 
 
 
@@ -196,8 +207,8 @@ def main():
         level=logging.INFO)
     args = parse_args()
     # load model
-    model = AutoModelForSequenceClassification.from_pretrained("roberta-large-mnli")
-    tokenizer = AutoTokenizer.from_pretrained("roberta-large-mnli")
+    model = AutoModelForSequenceClassification.from_pretrained("./models/roberta-large-mnli")
+    tokenizer = AutoTokenizer.from_pretrained("./models/roberta-large-mnli")
     model.eval()
     device = torch.device(args.device) if args.device >= 0 else torch.device('cpu')
     model.to(device)
