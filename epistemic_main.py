@@ -50,7 +50,7 @@ def batched_forward(args, tokenizer, model, pairs):
         batch = [f'{x} {SEP} {y}' for _,(x,y) in sorted_insts[ii:ii+bs]]
         encoded_inputs = tokenizer(batch, return_tensors='pt', padding = True, truncation=True).to(args.device)
         res = model(**encoded_inputs)
-        res_t = res['logits']
+        res_t = torch.nn.functional.softmax(res['logits'], dim=-1)
 
         res_logits = list(res_t.detach().cpu().numpy())  # List[len, ??]
         tmp_logits.extend(res_logits)
@@ -60,8 +60,9 @@ def batched_forward(args, tokenizer, model, pairs):
     sorted_logits.sort(key=lambda x: x[0])  # resort back
     all_logits = [z[-1] for z in sorted_logits]
     all_ids = np.argmax(all_logits, axis=-1)
+    all_scores = np.max(all_logits, axis=-1)
     all_labels = [model.config.id2label[idx] for idx in all_ids]
-    return all_labels
+    return all_labels, all_scores
 
 
 def categorical_f1(y, pred):
@@ -102,7 +103,7 @@ def decode_gold(args, tokenizer, model):
         if len(frames) > 0:
             frames_dict = {i:[f[0], f[1]] for i,f in enumerate(frames)}
             labels = decode_frames(args, tokenizer, model, frames_dict, subtopics, False)
-            labels_tf, labels_certainty = zip(*[l.split('-') for l in labels.values()])
+            labels_tf, labels_certainty = zip(*[l[0].split('-') for l in labels.values()])
             f_tf, f_certainty = zip(*[f[2].split('-') for f in frames])
             logging.info(f'Processed annotation file {file}: found {len(frames)} frames, tf categorical f1 {categorical_f1(f_tf, labels_tf)}, certainty categorical f1 {categorical_f1(f_certainty, labels_certainty)}')
 
@@ -117,8 +118,8 @@ def decode_demo(args, tokenizer, model):
         if str_question == '' and str_context == '':
             break
         ipt = [[str_question, str_context]]
-        ans = batched_forward(args, tokenizer, model, ipt)[0]
-        logging.info(f"=> {ans}")
+        ans, score = batched_forward(args, tokenizer, model, ipt)
+        logging.info(f"=> {ans[0]}, score => {score[0]}")
     # --
     logging.info("Finished!")
 
@@ -160,17 +161,17 @@ def decode_frames(args, tokenizer, model, frames, subtopics, replace_x=True):
         tf_pairs = [(f[0], subtopics[f[1]]['seqs']['template_pos'].replace('X', f[2])) for f in frames.values()]
     else:
         tf_pairs = [(f[0], subtopics[f[1]]['seqs']['template_pos']) for f in frames.values()]
-    tf_labels = batched_forward(args, tokenizer, model, tf_pairs)
+    tf_labels, tf_scores = batched_forward(args, tokenizer, model, tf_pairs)
     tf_labels = [nli2tf[l] for l in tf_labels]
 
     if replace_x:
         certainty_pairs = [(f[0], subtopics[f[1]]['seqs'][f'template_{tf2template[label]}_certain'].replace('X', f[2])) for f, label in zip(frames.values(), tf_labels)]
     else:
         certainty_pairs = [(f[0], subtopics[f[1]]['seqs'][f'template_{tf2template[label]}_certain']) for f, label in zip(frames.values(), tf_labels)]
-    certainty_labels = batched_forward(args, tokenizer, model, certainty_pairs)
+    certainty_labels, certainty_scores = batched_forward(args, tokenizer, model, certainty_pairs)
     certainty_labels = [nli2certain[l] for l in certainty_labels]
 
-    ret = {idx:f'{tf}-{certain}' for idx, tf, certain in zip(frames.keys(), tf_labels, certainty_labels)}
+    ret = {idx:[f'{tf}-{certain}', s1*s2] for idx, tf, certain, s1, s2 in zip(frames.keys(), tf_labels, certainty_labels, tf_scores, certainty_scores)}
     return ret
 
 
@@ -194,7 +195,8 @@ def decode_one_csr(doc, args, tokenizer, model):
     if len(frames) > 0:
         frames_epistemic = decode_frames(args, tokenizer, model, frames, subtopics)
         for idx in frames_epistemic:
-            doc.id2frame[idx]['epistemic_status'] = frames_epistemic[idx]
+            doc.id2frame[idx]['epistemic_status'] = frames_epistemic[idx][0]
+            doc.id2frame[idx]['epistemic_score'] = float(frames_epistemic[idx][1])
 
     cc.update({'sent': len(doc.sents), 'frames': len(frames)})
     return dict(cc)
