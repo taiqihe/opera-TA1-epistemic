@@ -77,7 +77,7 @@ class TemplateParser:
         sent = self.parser.parse(normed_tokens)  # parse this one!
 
         # step 3: more templates with simple negation and cerntainty probe
-        more_templates = self.create_more_templates(sent, final_tokens)
+        more_templates = self.create_more_templates(sent)
         # --
         if not quiet:
             logging.info(f"#-- Parse template: {template} ||| {hint}\n"
@@ -90,8 +90,8 @@ class TemplateParser:
         # todo: really bad replacements here ...
         REPL_MAP0 = {
             "can": "cannot", "may": "may not", "might": "might not",
-            "is": "isn't", "was": "wasn't", "are": "aren't", "were": "weren't", "will": "won't",
-            "did": "didn't", "does": "doesn't", "do": "don't",
+            "is": "is n't", "was": "was n't", "are": "are n't", "were": "were n't", "will": "wo n't",
+            "did": "did n't", "does": "does n't", "do": "do n't",
         }
         if any(t in REPL_MAP0 for t in tokens):  # simply negate the aux verb is fine
             ret = []
@@ -124,12 +124,12 @@ class TemplateParser:
                 if ii == center_verb_widx:  # add neg & put lemma
                     cur_lemma = parse_res['lemma'][ii]
                     if t == cur_lemma:
-                        _extra = "don't"
+                        _extra = ["do", "n't"]
                     elif t == cur_lemma + 's' or t == cur_lemma + 'es' or t in ['has']:  # special ones!
-                        _extra = "doesn't"
+                        _extra = ["does", "n't"]
                     else:
-                        _extra = "didn't"
-                    ret.append(_extra)
+                        _extra = ["did", "n't"]
+                    ret.extend(_extra)
                     ret.append(parse_res['lemma'][ii])
                 elif ii in center_verb_conjs:  # put lemma
                     ret.append(parse_res['lemma'][ii])
@@ -138,17 +138,43 @@ class TemplateParser:
         # --
         return ret
 
+    def find_root(self, parse):
+        acceptable_roots = {'VERB', 'AUX', 'PART'}
+        root = parse['head'].index(0)
+        if parse['upos'][root] not in acceptable_roots:
+            new_root = -1
+            for i in range(len(parse['text'])):
+                if parse['head'][i] == root+1 and parse['upos'][i] in acceptable_roots and parse['deprel'][i] not in {'csubj'}:
+                    new_root = i
+                    break
+            if new_root == -1:
+                logging.warning(f'No acceptable roots found, using default root position 1: {parse}')
+                new_root = 1
+            root = new_root
+        for i in range(root, -1, -1):
+            if parse['upos'][i] in acceptable_roots:
+                root = i
+            else:
+                break
+        return root
+
+
     def add_cerntainty(self, sent):
         parse = self.parser.parse(sent)
-        root = parse['head'].index(0)
-        
+        root = self.find_root(parse)
+        insert_pos = root
+        if parse['lemma'][root] == 'be' and parse['upos'][root+1] != 'PART':
+            insert_pos = root+1
+        sent = sent.copy()
+        sent.insert(insert_pos, self.cerntain_probe)
+        return sent
 
     def create_more_templates(self, sent):
         ret = {
             "template_pos": sent['text'],
             "template_neg": self.simple_negation(sent['text']),
-            "template_pos_certain": sent['text'],
-            "template_neg_certain": self.simple_negation(sent['text']),
+            "template_pos_certain": self.add_cerntainty(sent['text']),
+            "template_neg_certain": self.add_cerntainty(self.simple_negation(sent['text'])),
         }
         return ret
 
@@ -181,7 +207,7 @@ def postprocess_tokens(toks):
     return ts
 
 def main(input_file='', output_file='', stanza_dir='./stanza_resources'):
-    stanza.download('en', model_dir=stanza_dir)
+    # stanza.download('en', model_dir=stanza_dir)
     # --
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",

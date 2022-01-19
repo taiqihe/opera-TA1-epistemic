@@ -7,12 +7,15 @@ import logging
 import json
 import os
 import re
-import tqdm
 from collections import Counter, OrderedDict, defaultdict
+from pathlib import Path
+
+import tqdm
 import numpy as np
 import torch
-
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+from qa_data import CsrDoc
 
 SEP = '</s></s>'
 
@@ -27,14 +30,9 @@ def parse_args():
     # more
     parser.add_argument('--device', type=int, default=0)  # gpuid, <0 means cpu
     parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--input_topic', type=str)  # topic json input
     # specific ones for csr mode!
-    parser.add_argument('--csr_query_topic', type=int, default=1)  # query all subtopics under topic?
-    parser.add_argument('--csr_ctx_size', type=int, default=8)  # number of sent per chunk?
-    parser.add_argument('--csr_ctx_stride', type=int, default=4)  # number of sent between chunks?
-    parser.add_argument('--csr_prob_thresh', type=float, default=0.5)  # >this to be valid!
-    parser.add_argument('--csr_cf_sratio', type=float, default=0.5)  # max number (ratio*sent_num) per doc
-    parser.add_argument('--csr_cf_per_sent', type=int, default=1)  # max number of cf per sent
-    parser.add_argument('--csr_cf_context', type=int, default=5, help='Max number of sentences to count back for author queries')
+    # parser.add_argument('--csr_cf_context', type=int, default=5, help='Max number of sentences to count back for author queries')
     # --
     args = parser.parse_args()
     logging.info(f"Start decoding with: {args}")
@@ -50,7 +48,7 @@ def batched_forward(args, tokenizer, model, pairs):
     tmp_logits = []
     for ii in range(0, len(sorted_insts), bs):
         batch = [f'{x} {SEP} {y}' for _,(x,y) in sorted_insts[ii:ii+bs]]
-        encoded_inputs = tokenizer(batch, return_tensors='pt', padding = True).to(args.device)
+        encoded_inputs = tokenizer(batch, return_tensors='pt', padding = True, truncation=True).to(args.device)
         res = model(**encoded_inputs)
         res_t = res['logits']
 
@@ -67,7 +65,37 @@ def batched_forward(args, tokenizer, model, pairs):
 
 def decode_gold(args, tokenizer, model):
     # load dataset
-    pass
+    input_path = Path(args.input_path)
+    annotated_frames = input_path.glob('**/claim_frames.tab')
+    
+    with open(args.input_topic) as fd:
+        d_topic = json.load(fd)
+    subtopics = d_topic['subtopics']
+    subtopic_lookup = {s['subtopic']:k for k,s in subtopics.items()}
+
+    for file in annotated_frames:
+        with open(file) as fin:
+            header = fin.readline().strip().split('\t')
+            try:
+                subtopic_col = header.index('subtopic')
+                text_col = header.index('description')
+                epistemic_col = header.index('epistemic_status')
+            except ValueError:
+                continue
+            frames = []
+            for line in fin:
+                row = line.strip().split('\t')
+                if row[subtopic_col] in subtopic_lookup and row[epistemic_col]!='unknown':
+                    frames.append([row[text_col], subtopic_lookup[row[subtopic_col]], row[epistemic_col]])
+        if len(frames) > 0:
+            frames_dict = {i:[f[0], f[1]] for i,f in enumerate(frames)}
+            labels = decode_frames(args, tokenizer, model, frames_dict, subtopics, False)
+            labels_tf, labels_certainty = zip(*[l.split('-') for l in labels.values()])
+            f_tf, f_certainty = zip(*[f[2].split('-') for f in frames])
+            comp = lambda x,y: np.mean(np.char.equal(x,y))
+            logging.info(f'Processed annotation file {file}: found {len(frames)} frames, tf acc {comp(f_tf, labels_tf)}, certainty acc {comp(f_certainty, labels_certainty)}')
+
+
 
 def decode_demo(args, tokenizer, model):
     # --
@@ -86,31 +114,13 @@ def decode_demo(args, tokenizer, model):
 # =====
 # csr related
 
-def read_pct(file: str):
-    ret = OrderedDict()
-    with open(file) as fd:
-        fd.readline()  # skip first line
-        for line in fd:
-            fields = line.rstrip().split("\t")
-            parent_uid, child_uid, child_asset_type, topic = [fields[z] for z in [2,3,5,6]]
-            if child_asset_type != ".ltf.xml":
-                continue
-            if child_uid == "n/a":
-                continue
-            # assert child_uid not in ret
-            ret[child_uid] = {
-                'parent_uid': parent_uid, 'child_uid': child_uid, 'child_asset_type': child_asset_type, 'topic': topic,
-            }
-    return ret
 
-def decode_csr(args, model):
-    assert model.args.qa_head_type == 'label', "Should use labeling-head in this mode!"
-
+def decode_csr(args, tokenizer, model):
     logging.info(f"Decode csr: input={args.input_path}, output={args.output_path}")
     if not os.path.exists(args.output_path):
         os.makedirs(args.output_path, exist_ok=True)
     csr_files = sorted([z for z in os.listdir(args.input_path) if z.endswith('.csr.json')])
-    # for fn in tqdm.tqdm(csr_files):
+
     for fii, fn in enumerate(csr_files):
         try:
             input_path = os.path.join(args.input_path, fn)
@@ -118,9 +128,11 @@ def decode_csr(args, model):
         except Exception:
             logging.warning(f'Error trying to open {input_path}, skipping document')
             continue
-        # --
+        # input_path = os.path.join(args.input_path, fn)
+        # doc = CsrDoc(input_path)
+
         # process it
-        cc = decode_one_csr(doc, args, model)
+        cc = decode_one_csr(doc, args, tokenizer, model)
         logging.info(f"Process {doc.doc_id}[{fii}/{len(csr_files)}]: {cc}")
         # --
         doc.write_output(os.path.join(args.output_path, f"{doc.doc_id}.csr.json"))
@@ -128,111 +140,52 @@ def decode_csr(args, model):
     logging.info(f"Finished decoding.")
     # --
 
-def candidate_sort_key(cand):
-    # s0 = 0 if 'event' in cand['@type'] else 1  # prefer event over entity [nope!]
-    s1 = - np.average(cand['qa_scores']).item()
-    return s1  # only rank by score!
 
-def decode_one_csr(doc, args, model):
+def decode_frames(args, tokenizer, model, frames, subtopics, replace_x=True):
+    nli2tf = {'ENTAILMENT': 'true', 'NEUTRAL': 'true',  'CONTRADICTION': 'false'}
+    nli2certain = {'ENTAILMENT': 'certain', 'NEUTRAL': 'certain',  'CONTRADICTION': 'uncertain'}
+    tf2template = {'true': 'pos', 'false': 'neg'}
+    if replace_x:
+        tf_pairs = [(f[0], subtopics[f[1]]['seqs']['template_pos'].replace('X', f[2])) for f in frames.values()]
+    else:
+        tf_pairs = [(f[0], subtopics[f[1]]['seqs']['template_pos']) for f in frames.values()]
+    tf_labels = batched_forward(args, tokenizer, model, tf_pairs)
+    tf_labels = [nli2tf[l] for l in tf_labels]
+
+    if replace_x:
+        certainty_pairs = [(f[0], subtopics[f[1]]['seqs'][f'template_{tf2template[label]}_certain'].replace('X', f[2])) for f, label in zip(frames.values(), tf_labels)]
+    else:
+        certainty_pairs = [(f[0], subtopics[f[1]]['seqs'][f'template_{tf2template[label]}_certain']) for f, label in zip(frames.values(), tf_labels)]
+    certainty_labels = batched_forward(args, tokenizer, model, certainty_pairs)
+    certainty_labels = [nli2certain[l] for l in certainty_labels]
+
+    ret = {idx:f'{tf}-{certain}' for idx, tf, certain in zip(frames.keys(), tf_labels, certainty_labels)}
+    return ret
+
+
+def decode_one_csr(doc, args, tokenizer, model):
     cc = defaultdict(int)
-    _limit_q, _limit_full = GR.args_max_query_length, GR.args_max_seq_length
 
-    qas = []
+    with open(args.input_topic) as fd:
+        d_topic = json.load(fd)
+    subtopics = d_topic['subtopics']
+
+    frames = dict()
     for cf in doc.cf_frames:
-        x_question = re.sub(r'[\w/]*[-]?[xX]', cf['x_text'], cf['subtopic']['template'])
-        x_question = 'Who said that ' + x_question[0].lower() + x_question[1:] + '?'
-        x_question = TextPiece(x_question)
-
+        cf['epistemic_status'] = None
+        if cf['subtopic']['id'] not in subtopics:
+            logging.warning('Claim frame subtobic not found in list, skipping.')
+            continue
         x_ent = doc.id2frame[cf['x']]
-        x_sent_id = int(re.findall(r'\d+$', x_ent['provenance']['parent_scope'])[0])
+        sent = doc.id2sent[x_ent['provenance']['parent_scope']]
+        frames[cf['@id']] = [sent.orig_text, cf['subtopic']['id'], cf['x_text']]
 
-        _sid = x_sent_id
-        _remaining_budget = _limit_full - min(_limit_q, len(x_question.subtoken_ids)) - 3
-        while _remaining_budget > 0 and _sid >= max(0, x_sent_id-args.csr_cf_context):
-            _remaining_budget -= len(doc.sents[_sid].subtoken_ids)
-            _sid-=1
+    if len(frames) > 0:
+        frames_epistemic = decode_frames(args, tokenizer, model, frames, subtopics)
+        for idx in frames_epistemic:
+            doc.id2frame[idx]['epistemic_status'] = frames_epistemic[idx]
 
-        x_context = TextPiece.merge_pieces(doc.sents[_sid+1: x_sent_id+1], sent_range=(_sid+1, x_sent_id+1))
-        qas.append(QaInstance(x_context, x_question, ''))
-
-
-    # do forwarding and get all logits
-    all_probs = batched_forward(args, model, qas, apply_labeling_prob=True)  # List[(slen, )]
-    # --
-    # repack and decide outputs (for each question)
-    for _cf, _inst, _probs in zip(doc.cf_frames, qas, all_probs):
-        # assign scores
-        s_start, s_end = _inst.context.info['sent_range']  # sentence range
-        _cur_soff = _inst.context_offset  # subtoken offset
-        token_scores = dict()
-        for _sent in doc.sents[s_start:s_end]:
-            _t_probs = np.zeros(len(_sent.tokens))  # current probs
-            for _tid in _sent.sub2tid:
-                if _cur_soff < len(_probs):  # otherwise, things are truncated and just ignore those!
-                    _t_probs[_tid] = max(_t_probs[_tid], _probs[_cur_soff])  # note: maximum for subtok->tok
-                _cur_soff += 1
-            token_scores[_sent.info['id']] = _t_probs
-        
-        if _cur_soff < len(_inst.input_ids) and _inst.input_ids[_cur_soff] != GR.sub_tokenizer.sep_token_id:
-            logging.warning("Probably internal error!!")
-
-        # rank the events/entities (first for each sents)
-        doc_cands = []
-        for _sent in doc.sents[s_start:s_end]:
-            _sid = _sent.info['id']
-            _scores = token_scores[_sid]
-            # first get cands
-            _cands = []
-            for _cols in [doc.cand_entities]:
-                for _item in _cols[_sid]:  # check each item
-                    _widx, _wlen = _item['tok_posi']
-                    if any(z>args.csr_prob_thresh for z in _scores[_widx:_widx+_wlen]):
-                        # any token larger than thresh will be fine!
-                        _item['qa_scores'] = _scores[_widx:_widx+_wlen]
-                        _cands.append(_item)
-            # then prune by sent
-            cc['cand_init'] += len(_cands)
-            _cands_sorted = sorted(_cands, key=candidate_sort_key)
-            # --
-            sent_cands = []
-            for _one_cand in _cands_sorted:  # go through to check no-overlap!
-                if len(sent_cands) >= args.csr_cf_per_sent:
-                    break
-                _overlap = False
-                _start1, _length1 = doc.get_provenance_span(_one_cand, False, False)  # get full span!
-                for _cand2 in sent_cands:
-                    _start2, _length2 = doc.get_provenance_span(_cand2, False, False)  # get full span!
-                    if (_start2>=_start1 and _start2<(_start1+_length1)) or (_start1>=_start2 and _start1<(_start2+_length2)):
-                        _overlap = True
-                        break
-                if not _overlap:
-                    sent_cands.append(_one_cand)
-            # --
-            doc_cands.extend(sent_cands)
-        cc['cand_sent'] += len(doc_cands)
-        final_cands = sorted(doc_cands, key=candidate_sort_key)[:int(np.ceil(args.csr_cf_sratio * len(doc.sents)))]
-        cc['cand_final'] += len(final_cands)
-        # --
-        # put final results
-        # first set default value
-        _cf['claimer'] = _cf['claimer_score'] = _cf['claimer_text'] = None
-        for f_cand in final_cands:
-            ff_start, ff_length = doc.get_provenance_span(f_cand)
-            # try to find its claiming frame: preferring the smallest ranged one that contains the cand
-            best_ce, best_length = None, 100000
-            for ce in doc.claim_events[f_cand['provenance']['parent_scope']]:
-                ce_start, ce_length = doc.get_provenance_span(ce, False, False)
-                if ff_start>=ce_start and (ff_start+ff_length) <= (ce_start+ce_length) and ce_length < best_length:
-                    best_ce = ce
-                    best_length = ce_length
-            # find it?
-            cc['cand_finalCE'] += int(best_ce is not None)
-            # put it!
-            _cf['claimer'] = f_cand['@id']
-            _cf['claimer_score'] = np.average(f_cand['qa_scores']).item()
-            _cf['claimer_text'] = doc.id2frame[f_cand['@id']]['provenance']['text']
-    # --
-    cc.update({'sent': len(doc.sents), 'questions': len(qas)})
+    cc.update({'sent': len(doc.sents), 'frames': len(frames)})
     return dict(cc)
 
 
