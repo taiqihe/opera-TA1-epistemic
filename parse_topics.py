@@ -106,8 +106,9 @@ class TemplateParser:
             parse_res = self.parser.parse(tokens)
             root_widx = [widx for widx, (head, deprel) in enumerate(zip(parse_res['head'], parse_res['deprel']))
                          if head==0 and deprel=='root']
-            if len(root_widx)==0 or parse_res['upos'][root_widx[0]] != 'VERB':
-                all_verb_widxes = [widx for widx, upos in enumerate(parse_res['upos']) if upos=='VERB']
+            _vset = ["VERB", "AUX"]  # include AUX verbs!
+            if len(root_widx)==0 or parse_res['upos'][root_widx[0]] not in _vset:
+                all_verb_widxes = [widx for widx, upos in enumerate(parse_res['upos']) if upos in _vset]
                 if len(all_verb_widxes) > 0:
                     center_verb_widx = all_verb_widxes[0]
                     logging.warning(f"Cannot find center verb, fall back to VERBs: {parse_res}")
@@ -118,7 +119,7 @@ class TemplateParser:
             else:
                 center_verb_widx = root_widx[0]
             # negate for center-verb
-            center_verb_conjs = [widx for widx, (upos, head, deprel) in enumerate(zip(parse_res['upos'], parse_res['head'], parse_res['deprel'])) if head==(1+center_verb_widx) and deprel=='conj' and upos=='VERB']
+            center_verb_conjs = [widx for widx, (upos, head, deprel) in enumerate(zip(parse_res['upos'], parse_res['head'], parse_res['deprel'])) if head==(1+center_verb_widx) and deprel=='conj' and upos in _vset]
             ret = []
             for ii, t in enumerate(parse_res['text']):
                 if ii == center_verb_widx:  # add neg & put lemma
